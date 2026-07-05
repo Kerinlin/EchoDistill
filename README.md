@@ -2,10 +2,10 @@
 
 > 一个 Tampermonkey 油猴脚本，自动抓取当前页面的评论区，调用任意 OpenAI 兼容 LLM，输出结构化的中文 Markdown 舆情报告，并附带 AI 对抗性审视。
 
-- 版本：`1.6.0`
+- 版本：`1.7.0`
 - 作者：Kerinlin
 - 协议：MIT
-- 单文件零依赖：`ai-comment-summarizer.user.js`
+- 单文件油猴脚本：`ai-comment-summarizer.user.js`（运行时通过 CDN 引入 `html2canvas` 用于复制图片）
 
 ---
 
@@ -18,9 +18,10 @@
 - **智能分页与加载**：自动滚动加载、Shadow DOM 遍历、「查看更多」按钮自动点击；针对 Hacker News 用 `GM_xmlhttpRequest` 拉取分页 HTML 后合并 DOM；针对 linux.do 走 `/t/{id}.json` 全量拉取并按 `reply_to_post_number` 计算回复深度。
 - **可中断**：抓取/推理任意阶段点击「停止总结」即时终止，请求通过 `AbortSignal` 一路下传。
 - **高度可配置**：自定义 API Key、Endpoint、模型、最大评论数、最小点赞过滤、System Prompt 全部可改，支持重置默认 Prompt。
+- **双复制模式**：点击「📋 复制」弹出居中浮层，可选「📋 复制为文本」或「🖼️ 复制为图片」——图片基于 `html2canvas` 将整张 panel 卡片（标题/话题/正文/对抗性审视）渲染为 PNG，写入系统剪贴板；浏览器不支持 `ClipboardItem` 时（如 Firefox）自动降级为下载 PNG 文件。
 - **模型列表自动补全**：在设置面板输入框 focus 时自动请求 `{endpoint}/v1/models` 拉取模型列表，按输入实时过滤；获取失败可手动输入。
 - **零依赖渲染**：内置轻量 Markdown 渲染器（标题/列表/引用/代码块/链接/删除线/加粗斜体），不引入任何外部 UI 库。
-- **沉浸式 UI**：羊皮纸 + 墨蓝主题，悬浮 FAB、骨架屏加载态、一键复制原始 Markdown、Trusted Types 兼容。
+- **沉浸式 UI**：羊皮纸 + 墨蓝主题，悬浮 FAB、骨架屏加载态、Trusted Types 兼容。
 
 ---
 
@@ -111,7 +112,9 @@
 2. 点击底部「✨ 开始总结」。
 3. 脚本会自动滚动加载评论 → 实时显示已抓取数量 → 调用 AI 生成中立归纳 → 再次调用 AI 生成对抗性审视。
 4. 抓取或推理过程中按钮会变为「⏹ 停止总结」，可随时中断。
-5. 结果区右下「📋 复制」一键复制完整 Markdown（含对抗性审视段落及来源标注）。
+5. 点击底部「📋 复制」会弹出居中浮层，提供两种复制方式（上下排列）：
+  - **📋 复制为文本**：写入完整 Markdown（含对抗性审视段落及来源标注）到系统剪贴板。
+  - **🖼️ 复制为图片**：将整张 panel 卡片（标题/话题/正文/对抗性审视）通过 `html2canvas` 渲染为 PNG。截图期间会用同色遮罩盖住 panel 防止用户看到变形，渲染完成后写入剪贴板；浏览器不支持图片剪贴板时（如 Firefox）自动改为下载 PNG 文件。
 
 ---
 
@@ -137,12 +140,17 @@
                                  │
                                  ▼
                           [沉浸式 UI 面板]
+                                 │
+                                 ▼
+                  [复制层] ── 文本：navigator.clipboard.writeText
+                          ── 图片：html2canvas → PNG → 剪贴板 / 下载降级
 ```
 
 - **抓取层**：`Scrapers` 对象按平台分发；Shadow DOM 与 Web Component 都做了穿透。
 - **加载层**：每平台独立 autoLoad 函数（`autoLoadComments` / `autoLoadHNComments` / `autoLoadZHAnswers` / `autoLoadLinuxdoComments` / `autoLoadXHSComments` / `autoLoadBiliComments` / `autoLoadTwitterComments`），全部支持 `token.aborted` 中断。
 - **推理层**：`callAI` 出中立报告，`callAIInsight` 出对抗性审视；均为 OpenAI 兼容 `/v1/chat/completions`，超时 120s。
 - **渲染层**：`md()` 把模型返回的 Markdown 转成受控 HTML，对抗性审视段落用独立主题色（赭红 `#8b3a1f`）区分。
+- **复制层**：`copyAsImage()` 临时把 panel 移到 `(0,0)` 并撑开 `max-height` → `html2canvas` 截图 → `canvas.toBlob` → `navigator.clipboard.write(ClipboardItem)`；不支持图片剪贴板时触发 `<a download>` 降级下载。
 
 ---
 
@@ -198,6 +206,9 @@
 - 评论去重基于文本完全匹配（小红书、Twitter），对仅空格/标点差异的近似重复不生效。
 - 默认 Endpoint `http://localhost:8317` 指向本地代理，部署在无此代理的机器上需要替换为真实可访问的 OpenAI 兼容服务。
 - `@connect *` 已放开所有出站域名，请自行确保 Endpoint 可信。
+- 复制图片功能依赖运行时从 `cdn.jsdelivr.net` 加载 `html2canvas`，CDN 不可达时该功能不可用（不影响文本复制和其它功能）。
+- 严格 CSP 站点（如 Hacker News、Reddit）下仍可用——`html2canvas` 走 DOM 解析式渲染，不依赖 SVG/`img-src` data URI，不受 CSP 限制。
+- 复制图片时若浏览器不支持 `ClipboardItem`（Firefox 等），会自动改为下载 PNG 文件，按钮提示「已下载图片」。
 
 ---
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 评论总结助手
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.7.0
 // @description  自动抓取当前页面的评论并使用 AI 进行总结（Markdown + 主题摘要 + AI 独立洞察）
 // @author       Kerinlin
 // @match        *://*.youtube.com/*
@@ -18,6 +18,7 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
+// @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @connect      *
 // @connect      localhost
 // @connect      127.0.0.1
@@ -27,6 +28,9 @@
 (function () {
   'use strict';
 
+  // === 基础工具：trustedTypes 策略 + 安全 HTML 注入 ===
+  // CSP 严格站点（如 GitHub、Hacker News）要求 trustedTypes 才能写 innerHTML；
+  // 创建一次性 policy 后所有 innerHTML 写入都走 safeHTML，无 policy 则直接赋值。
   const _ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPolicy)
     ? trustedTypes.createPolicy('ai-comment-summarizer', { createHTML: s => s })
     : null;
@@ -35,6 +39,7 @@
     else el.innerHTML = html;
   }
 
+  // === 配置与 Prompt 常量 ===
   const CONFIG_KEY = 'ai_comment_summarizer_config';
 
   const DEFAULT_PROMPT = `你是一位资深的社区舆情分析师。请阅读我提供的「帖子标题 + 评论列表」，输出一份结构化的中文分析报告。
@@ -93,6 +98,7 @@
 3. 不要客气、不要自我消解、不要"以上仅供参考"。
 4. 判断方向不预设——证据支持主流就认同，证据不支持就反对，不允许为了对抗而对抗。`;
 
+  // 默认配置：首次安装时的回退值，apiKey/apiEndpoint 为本地代理默认值。
   const DEFAULT_CONFIG = {
     apiKey: 'sk-sOisCHwyDG3GIhUvL',
     apiEndpoint: 'http://localhost:8317',
@@ -102,12 +108,16 @@
     customPrompt: DEFAULT_PROMPT
   };
 
+  // HTML 转义：md 渲染前先转义文本，避免 XSS / 显示乱码
   function escapeHtml(s) {
     return s.replace(/[&<>"']/g, c => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     }[c]));
   }
 
+  // 极简 Markdown → HTML 渲染器（无依赖）
+  // 流程：抽取 code block/inline 占位 → escape → 块级元素（标题/引用/列表/分隔线）→ 行内（粗斜体/链接）→ 段落 → 还原 code 占位
+  // 用 \x00.. 占位符避免内联代码被 markdown 语法误伤
   function md(input) {
     if (!input) return '';
     const codeBlocks = [];
@@ -116,12 +126,12 @@
       return '\x00CB' + (codeBlocks.length - 1) + '\x00';
     });
     const inlineCodes = [];
-    // 修复 1：补回起始反引号，原代码 `([^\n]+)` 缺少开头的 `
     input = input.replace(/`([^\n]+)`/g, (_, code) => {
       inlineCodes.push(code);
       return '\x00IC' + (inlineCodes.length - 1) + '\x00';
     });
     let html = escapeHtml(input);
+    // 标题：从 h6 → h1 依次匹配，避免 # 前缀被更高层级规则吞掉
     html = html.replace(/^######\s?(.*)$/gm, '<h6>$1</h6>')
                .replace(/^#####\s?(.*)$/gm, '<h5>$1</h5>')
                .replace(/^####\s?(.*)$/gm, '<h4>$1</h4>')
@@ -129,25 +139,31 @@
                .replace(/^##\s?(.*)$/gm, '<h2>$1</h2>')
                .replace(/^#\s?(.*)$/gm, '<h1>$1</h1>');
     html = html.replace(/^\s*---\s*$/gm, '<hr>');
+    // 引用块：连续 &gt; 开头行合并为 blockquote，内部用 <br> 换行
     html = html.replace(/(^|\n)((?:&gt; .*(?:\n|$))+)/g, (m, pre, block) => {
       const inner = block.trim().split('\n').map(l => l.replace(/^&gt;\s?/, '')).join('<br>');
       return pre + '<blockquote>' + inner + '</blockquote>';
     });
+    // 无序列表：连续 - 或 * 开头行合并为 ul/li
     html = html.replace(/(^|\n)((?:[-*]\s+.*(?:\n|$))+)/g, (m, pre, block) => {
       const items = block.trim().split('\n').map(l => '<li>' + l.replace(/^[-*]\s+/, '') + '</li>').join('');
       return pre + '<ul>' + items + '</ul>';
     });
+    // 行内：粗体 → 斜体（避免吞粗体的 **）→ 删除线
     html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
                .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
                .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+    // 链接：仅 http(s)，强制 target=_blank + rel=noopener 防止反向 tabnabbing
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
         '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // 段落：以空行分隔的文本块包 <p>，已识别的块级标签直接保留
     html = html.split(/\n{2,}/).map(p => {
       p = p.trim();
       if (!p) return '';
       if (/^<(h\d|ul|ol|blockquote|hr|pre)/.test(p)) return p;
       return '<p>' + p.replace(/\n/g, '<br>') + '</p>';
     }).join('\n');
+    // 最后还原 code 占位为 <pre><code> / <code>，对代码内容再做一次 escape
     html = html.replace(/\x00CB(\d+)\x00/g, (_, i) =>
         '<pre><code>' + escapeHtml(codeBlocks[+i]) + '</code></pre>');
     html = html.replace(/\x00IC(\d+)\x00/g, (_, i) =>
@@ -155,6 +171,7 @@
     return html;
   }
 
+  // 配置持久化：合并默认值 + 用户存储，避免老版本缺字段崩溃
   function loadConfig() {
     try { return Object.assign({}, DEFAULT_CONFIG, JSON.parse(GM_getValue(CONFIG_KEY, '{}'))); }
     catch { return Object.assign({}, DEFAULT_CONFIG); }
@@ -164,6 +181,12 @@
 
   let config = loadConfig();
 
+  // === 全局样式注入 ===
+  // 配色系统：parchment 纸感（#faf5ea 底 / #f5efe0 区块 / #e0d5c0 描边）
+  //          + ink-blue 主色（#1B365D）+ 红砖强调（#8b3a1f 用于 insight/警告）
+  // 分区：FAB 按钮 / panel 容器 / 头部+话题+正文 / 骨架屏+加载态 /
+  //       操作行按钮 / 对抗性审视 insight 块 / 正文 markdown 排版 /
+  //       设置面板 / 模型下拉 / 复制方式弹窗
   GM_addStyle(`
 #ai-fab{position:fixed;bottom:24px;right:24px;z-index:999999;width:52px;height:52px;border-radius:50%;background:#1B365D;color:#faf5ea;border:1px solid #14263f;cursor:pointer;box-shadow:0 2px 8px rgba(27,54,93,.22);font-size:22px;display:flex;align-items:center;justify-content:center;transition:transform .2s,box-shadow .2s;font-family:Georgia,"Songti SC","STSong",serif}
 #ai-fab:hover{transform:scale(1.06);box-shadow:0 4px 14px rgba(27,54,93,.32)}
@@ -251,8 +274,25 @@
 .ai-model-item:hover{background:#f0e9d8}
 .ai-model-loading,.ai-model-error{font-style:italic;color:#8a7f70;cursor:default}
 .ai-model-loading:hover,.ai-model-error:hover{background:transparent}
+#ai-copy-modal{position:fixed;inset:0;z-index:1000001;display:none;align-items:center;justify-content:center;background:rgba(42,37,32,.42);backdrop-filter:blur(2px);animation:ai-pop .16s ease-out}
+#ai-copy-modal.open{display:flex}
+#ai-copy-modal .ai-cm-card{position:relative;width:280px;max-width:calc(100vw - 40px);background:#faf5ea;color:#2a2520;border-radius:5px;box-shadow:0 14px 44px rgba(42,37,32,.28);padding:22px 20px 18px;border:1px solid #e0d5c0;font-family:Georgia,"Songti SC","STSong","Source Han Serif SC",serif}
+#ai-copy-modal .ai-cm-title{font-size:14px;font-weight:600;color:#1B365D;text-align:center;margin-bottom:16px;letter-spacing:.02em}
+#ai-copy-modal .ai-cm-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:8px;padding:11px 12px;border:1px solid #e0d5c0;border-radius:3px;cursor:pointer;font-size:13.5px;font-weight:500;line-height:1;font-family:inherit;transition:background .15s,transform .1s;margin-bottom:10px}
+#ai-copy-modal .ai-cm-btn:last-of-type{margin-bottom:0}
+#ai-copy-modal .ai-cm-btn:active{transform:scale(.97)}
+#ai-copy-modal .ai-cm-text{background:#1B365D;color:#faf5ea;border-color:#14263f}
+#ai-copy-modal .ai-cm-text:hover{background:#14263f}
+#ai-copy-modal .ai-cm-image{background:#faf5ea;color:#3a342c}
+#ai-copy-modal .ai-cm-image:hover{background:#f0e9d8}
+#ai-copy-modal .ai-cm-x{position:absolute;top:8px;right:10px;width:24px;height:24px;border:none;background:transparent;color:#8a7f70;font-size:16px;cursor:pointer;line-height:1;display:flex;align-items:center;justify-content:center;border-radius:3px}
+#ai-copy-modal .ai-cm-x:hover{background:#f0e9d8;color:#1B365D}
 `);
 
+  // === 平台爬虫集合 ===
+  // 每个方法同步抓取当前 DOM 上的评论，返回统一结构 { author, text, likes }。
+  // 特殊字段：zhihu.accepted（被采纳答案）、hackernews.depth（嵌套层级）、linuxdo.isOP（楼主标记）。
+  // 复杂平台（Twitter、Linux.do）支持外部 __ai_*_comments 缓存，由 autoLoad* 异步填充。
   const Scrapers = {
     youtube() {
       return Array.from(document.querySelectorAll('ytd-comment-thread-renderer')).map(el => ({
@@ -383,6 +423,7 @@
     }
   };
 
+  // 根据当前 hostname 选定爬虫；未匹配站点返回 null
   function detectScraper() {
     const h = location.hostname;
     if (h.includes('youtube.com')) return 'youtube';
@@ -398,6 +439,9 @@
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+  // === 通用自动加载（YouTube / Reddit 共用）===
+  // 通过反复滚动 + 点击"更多"按钮直到评论数稳定或达到 max。
+  // 两阶段：先快速滚动 40 次（连续 4 次无新增视为稳定），再 8 次慢速兜底。
   async function autoLoadComments(scraper, max, cb, token) {
     let last = 0, stable = 0;
     for (let i = 0; i < 40; i++) {
@@ -437,6 +481,9 @@
     }
   }
 
+  // === Twitter/X 自动加载 ===
+  // 用 Map 按 text 去重（同一条推文会反复出现）。
+  // 两阶段：先滚到底 40 次（含偶尔回滚触发懒加载），再从底部 6 等分往上扫一遍捞漏。
   async function autoLoadTwitterComments(scraper, max, cb, token) {
     const collected = new Map();
 
@@ -506,6 +553,7 @@
     cb && cb(collected.size);
   }
 
+  // 小红书评论在独立滚动容器内，向上找第一个 overflow:auto/scroll 且有滚动空间的祖先
   function findXHSCommentScroller() {
     const item = document.querySelector('.comment-item, .comment-item-sub');
     let node = item?.parentElement;
@@ -519,6 +567,8 @@
     return document.scrollingElement;
   }
 
+  // === 小红书 / B 站自动加载 ===
+  // SAFE 上限 500 避免无限滚动把内存撑爆；二者结构类似：滚动到底 → 等加载 → 数稳定即停。
   async function autoLoadXHSComments(scraper, max, cb, token) {
     const SAFE = 500;
     let last = 0, stable = 0;
@@ -560,10 +610,14 @@
     }
   }
 
+  // === Shadow DOM 全局扫描 + 通用"更多"按钮点击 ===
+  // YouTube/B 站评论藏在 closed shadow root，必须递归收集 host 才能命中按钮。
+  // _clickedBtns 用 WeakSet 避免按钮被回收后内存泄漏；_scanTick 每 8 轮重新扫描一次 shadow 树（成本高）。
   const _shadowHosts = new Set();
   const _clickedBtns = new WeakSet();
   let _scanTick = 0;
 
+  // 递归收集所有 shadowRoot 的 host（含嵌套 shadow）
   function collectShadowHosts() {
     _shadowHosts.clear();
     function walk(root) {
@@ -577,6 +631,8 @@
     walk(document);
   }
 
+  // 在 document + 所有已知 shadow root 内找匹配"更多/展开/View more"的按钮并点击
+  // 关键过滤：排除侧边栏（避免误点关注/Trends）、限制文字长度（避免点到段落）、显式黑名单
   function clickMoreButtons() {
     if ((_scanTick++ & 7) === 0) collectShadowHosts();
 
@@ -608,6 +664,7 @@
     return clicked;
   }
 
+  // HN 翻页用 GM_xmlhttpRequest 绕过跨域，anonymous 不带 cookie 减少服务器压力
   function fetchHNPage(url) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -623,6 +680,8 @@
     });
   }
 
+  // === Hacker News 自动加载 ===
+  // HN 是服务端分页（?p=2,3...），通过 a.morelink 拿下一页 HTML，DOMParser 解析后把评论 table 追加到当前页
   async function autoLoadHNComments(scraper, max, cb, token) {
     let collected = scraper().length;
     cb && cb(collected);
@@ -656,6 +715,8 @@
     }
   }
 
+  // === 知乎回答自动加载 ===
+  // 先点开所有"展开全文"，再循环点"更多回答"/滚动到底，stable=3 即停
   async function autoLoadZHAnswers(scraper, max, cb, token) {
     let last = 0, stable = 0;
     for (let i = 0; i < 30; i++) {
@@ -681,6 +742,9 @@
     }
   }
 
+  // === Linux.do 自动加载（走 Discourse JSON API）===
+  // 走 /t/{id}.json?page=N 翻页比 DOM 滚动可靠，按 post_number 建索引后递归算 depth 还原嵌套层级。
+  // 失败回退到 DOM 抓取（scraper 直接读 .topic-post）。结果写入 window.__ai_linuxdo_comments 供 scraper 取。
   async function autoLoadLinuxdoComments(scraper, max, cb, token) {
     const m = location.pathname.match(/\/t\/(?:[^\/]+\/)?(\d+)/);
     if (!m) return;
@@ -707,6 +771,7 @@
         await sleep(300);
       }
 
+      // 通过 reply_to_post_number 链式追溯祖先算嵌套深度，visited 防环，d>20 兜底
       const map = new Map(allPosts.map(p => [p.post_number, p]));
       function getDepth(p) {
         let d = 0, cur = p, visited = new Set();
@@ -742,10 +807,12 @@
     }
   }
 
+  // === 模型列表自动补全（OpenAI 兼容 /v1/models）===
   function deriveModelsUrl(endpoint) {
     return endpoint.replace(/\/+$/, '') + '/v1/models';
   }
 
+  // 拉取可用模型列表，兼容 {data:[...]} / {models:[...]} / [str] 三种返回格式
   async function fetchModels(endpoint, apiKey) {
     const url = deriveModelsUrl(endpoint);
     return new Promise((resolve, reject) => {
@@ -774,9 +841,11 @@
     });
   }
 
+  // 简单缓存：endpoint+apiKey 不变就复用上次结果，避免每次 focus 都打一次 API
   let _modelsCache = null;
   let _modelsCacheKey = '';
 
+  // 模型输入框自动补全：focus 时拉模型列表，input 时按子串过滤，blur 延迟 200ms 关闭（让 click 先触发）
   function attachModelAutocomplete(input) {
     const wrap = input.parentElement;
     wrap.style.position = 'relative';
@@ -820,6 +889,8 @@
     input.addEventListener('blur', () => setTimeout(hide, 200));
   }
 
+  // === 中止令牌 + 错误处理 ===
+  // 自实现 token 而非 AbortController：兼容老浏览器，且 onAbort 回调可在 abort 后注册时立即触发。
   function createToken() {
     const t = { aborted: false, _cbs: [] };
     t.onAbort = (fn) => { if (t.aborted) { try { fn(); } catch {} } else t._cbs.push(fn); };
@@ -834,6 +905,8 @@
   function isAbortErr(e) { return e && e.__aborted === true; }
   function abortErr() { const e = new Error('已终止'); e.__aborted = true; return e; }
 
+  // === 通用 Chat Completions 调用 ===
+  // 兼容多种返回结构（choices[0].message / text / content[0].text 等），JSON 解析失败时回退到正则提取 content
   function sendChat(systemMsg, userMsg, token) {
     if (!config.apiKey) return Promise.reject(new Error('请先在设置中填入 API Key'));
     return new Promise((resolve, reject) => {
@@ -896,6 +969,7 @@
     });
   }
 
+  // 主总结调用：把评论编号 + 点赞数 + 深度（仅 HN/Linux.do 有嵌套）拼成文本，注入 customPrompt
   async function callAI(title, comments, opts = {}, token) {
     const useDepth = opts.platform === 'hackernews' || opts.platform === 'linuxdo';
     const text = comments.map((c, i) => {
@@ -909,11 +983,14 @@
     return sendChat(sysMsg, userMsg, token);
   }
 
+  // 对抗性审视调用：把主总结喂回去，让 AI 站到反方位置挑刺 + 下判断
   async function callAIInsight(mainText, token) {
     const userMsg = `以下是针对某帖子评论的中立归纳报告：\n\n${mainText}\n\n请基于以上归纳，给出你的独立判断。`;
     return sendChat(INSIGHT_PROMPT, userMsg, token);
   }
 
+  // 拆分 AI 原始输出：以"## AI 独立判断"为界，前半为 main（中立归纳），后半为 insight（对抗性审视）
+  // 额外从 insight 提取信心程度（高/中/低），但目前 confidence 字段未被 UI 使用，预留给未来扩展
   function splitInsight(raw) {
     const m = raw.match(/^#{2,3}\s*AI\s*独立判断/m);
     if (!m) return { main: raw, insight: '', confidence: '' };
@@ -925,6 +1002,8 @@
     return { main, insight, confidence };
   }
 
+  // === UI 构建：FAB / panel / settings / copy-modal ===
+  // 创建顺序固定：fab → panel → settings → modal，挂到 body 后再统一绑事件。
   function createUI() {
     const fab = Object.assign(document.createElement('button'), { id: 'ai-fab', textContent: '✨', title: 'AI 评论总结' });
     document.body.appendChild(fab);
@@ -970,6 +1049,22 @@
     document.body.appendChild(set);
     attachModelAutocomplete(set.querySelector('[data-k="model"]'));
 
+    // 复制方式弹窗：上下两个按钮（文本/图片），点遮罩或 × 关闭
+    const modal = document.createElement('div');
+    modal.id = 'ai-copy-modal';
+    safeHTML(modal, `
+<div class="ai-cm-card">
+<button class="ai-cm-x" title="关闭">×</button>
+<div class="ai-cm-title">选择复制方式</div>
+<button class="ai-cm-btn ai-cm-text">📋 复制为文本</button>
+<button class="ai-cm-btn ai-cm-image">🖼️ 复制为图片</button>
+</div>`);
+    document.body.appendChild(modal);
+
+    const closeCopyModal = () => modal.classList.remove('open');
+    modal.querySelector('.ai-cm-x').onclick = closeCopyModal;
+    modal.onclick = e => { if (e.target === modal) closeCopyModal(); };
+
     fab.onclick = () => panel.classList.toggle('open');
     panel.querySelector('#ai-x').onclick = () => panel.classList.remove('open');
     panel.querySelector('#ai-set').onclick = () => {
@@ -977,10 +1072,41 @@
       set.querySelectorAll('[data-k]').forEach(i => { i.value = config[i.dataset.k] ?? ''; });
     };
     panel.querySelector('#ai-run').onclick = () => runSummary(panel);
+    // 主复制按钮：仅作为弹窗触发，无内容时不响应
     panel.querySelector('#ai-copy').onclick = () => {
       const src = panel.dataset.rawCopy || panel.dataset.raw || '';
       if (!src) return;
-      navigator.clipboard.writeText(src).then(() => flash(panel.querySelector('#ai-copy'), '已复制 ✓'));
+      modal.classList.add('open');
+    };
+    // 复制文本：navigator.clipboard.writeText，成功后 flash 提示
+    modal.querySelector('.ai-cm-text').onclick = async () => {
+      const src = panel.dataset.rawCopy || panel.dataset.raw || '';
+      if (!src) return;
+      try {
+        await navigator.clipboard.writeText(src);
+        flash(panel.querySelector('#ai-copy'), '已复制文本 ✓');
+        closeCopyModal();
+      } catch (e) {
+        flash(panel.querySelector('#ai-copy'), '复制失败');
+      }
+    };
+    // 复制图片：按钮变 loading 状态 → 调 copyAsImage → 按返回状态显示"已复制/已下载"
+    modal.querySelector('.ai-cm-image').onclick = async () => {
+      const btn = modal.querySelector('.ai-cm-image');
+      const original = btn.textContent;
+      btn.textContent = '⏳ 生成图片中...';
+      btn.disabled = true;
+      try {
+        const status = await copyAsImage(panel);
+        flash(panel.querySelector('#ai-copy'), status === 'download' ? '已下载图片 ✓' : '已复制图片 ✓');
+        closeCopyModal();
+      } catch (e) {
+        console.error('[AI评论总结] 复制图片失败:', e);
+        flash(panel.querySelector('#ai-copy'), '图片生成失败');
+      } finally {
+        btn.textContent = original;
+        btn.disabled = false;
+      }
     };
     set.querySelector('[data-act="cancel"]').onclick = () => set.classList.remove('open');
     set.querySelector('[data-act="save"]').onclick = () => {
@@ -997,14 +1123,136 @@
     };
   }
 
+  // 按钮临时反馈：1.2s 内把按钮文案 + 颜色换成 txt 后恢复
+  // 注意 background 和 color 都要清空（内联 style 不会被 class 覆盖）
   function flash(btn, txt) {
     const old = btn.textContent;
     btn.textContent = txt;
     btn.style.background = '#1B365D';
     btn.style.color = '#faf5ea';
-    setTimeout(() => { btn.textContent = old; btn.style.background = ''; }, 1200);
+    setTimeout(() => {
+      btn.textContent = old;
+      btn.style.background = '';
+      btn.style.color = '';
+    }, 1200);
   }
 
+  // === panel 截图为 PNG ===
+  // 流程：备份原 inline 样式 → mask 全屏遮挡（用户看不到变形）→ 临时把 panel 移到 (0,0) 并撑开 max-height
+  //       → 隐藏顶栏按钮和操作行 → 等两帧 → html2canvas → canvas.toBlob
+  //       → 优先写剪贴板，不支持/失败则降级为下载 PNG
+  //       → finally 恢复所有 inline 样式 + 移除 mask
+  // 关键决策（用注释保留 WHY）：
+  //   - 用 mask 而非 clone：html2canvas 渲染时 visibility:hidden/opacity:0 会被当作"不绘制"，
+  //     clone + 任何隐藏手段都会输出空图；只能用真实可见元素 + 遮罩遮挡
+  //   - 不传 windowWidth/windowHeight：会让 html2canvas 内部 iframe 宽度 = panel 宽度，
+  //     panel CSS max-width:calc(100vw-40px) 在小 iframe 内被压缩，canvas 右侧出现空白
+  //   - 必须把 panel 移到 left:0：html2canvas 按元素 boundingRect.left 渲染到 canvas，
+  //     原 panel right:24px 会让 canvas 左侧出现等宽空白
+  async function copyAsImage(panel) {
+    const html2canvas = window.html2canvas;
+    if (!html2canvas || typeof html2canvas !== 'function') {
+      throw new Error('html2canvas 库未加载');
+    }
+
+    const body = panel.querySelector('.ai-body');
+    const actions = panel.querySelector('.ai-hd .ai-actions');
+    const actionsRow = panel.querySelector('.ai-actions-row');
+
+    const backup = {
+      panelMaxHeight: panel.style.maxHeight,
+      panelHeight: panel.style.height,
+      panelLeft: panel.style.left,
+      panelTop: panel.style.top,
+      panelRight: panel.style.right,
+      panelBottom: panel.style.bottom,
+      bodyOverflow: body ? body.style.overflow : '',
+      bodyMaxHeight: body ? body.style.maxHeight : '',
+      bodyFlex: body ? body.style.flex : '',
+      bodyHeight: body ? body.style.height : '',
+      actionsDisplay: actions ? actions.style.display : '',
+      actionsRowDisplay: actionsRow ? actionsRow.style.display : '',
+    };
+
+    // 不透明遮罩：截图期间盖住 panel 防止用户看到变形
+    const mask = document.createElement('div');
+    mask.style.cssText = 'position:fixed;inset:0;background:#faf5ea;z-index:1000001;';
+    document.body.appendChild(mask);
+
+    try {
+      // 临时撑开 panel + body，隐藏非内容元素
+      panel.style.maxHeight = 'none';
+      panel.style.height = 'auto';
+      panel.style.left = '0';
+      panel.style.top = '0';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      if (body) {
+        body.style.overflow = 'visible';
+        body.style.maxHeight = 'none';
+        body.style.flex = 'none';
+        body.style.height = 'auto';
+      }
+      if (actions) actions.style.display = 'none';
+      if (actionsRow) actionsRow.style.display = 'none';
+
+      // 等两帧让浏览器完成自然布局
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+      const w = panel.offsetWidth;
+      const h = panel.offsetHeight;
+
+      const canvas = await html2canvas(panel, {
+        scale: 2,
+        backgroundColor: '#faf5ea',
+        useCORS: true,
+        logging: false,
+        width: w,
+        height: h,
+      });
+
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('canvas.toBlob 返回空');
+
+      if (navigator.clipboard && window.ClipboardItem) {
+        try {
+          await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+          return 'clipboard';
+        } catch (e) {
+          console.warn('[AI评论总结] 剪贴板写入失败，降级下载:', e);
+        }
+      }
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ai-summary-${Date.now()}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return 'download';
+    } finally {
+      panel.style.maxHeight = backup.panelMaxHeight;
+      panel.style.height = backup.panelHeight;
+      panel.style.left = backup.panelLeft;
+      panel.style.top = backup.panelTop;
+      panel.style.right = backup.panelRight;
+      panel.style.bottom = backup.panelBottom;
+      if (body) {
+        body.style.overflow = backup.bodyOverflow;
+        body.style.maxHeight = backup.bodyMaxHeight;
+        body.style.flex = backup.bodyFlex;
+        body.style.height = backup.bodyHeight;
+      }
+      if (actions) actions.style.display = backup.actionsDisplay;
+      if (actionsRow) actionsRow.style.display = backup.actionsRowDisplay;
+      mask.remove();
+    }
+  }
+
+  // 加载骨架屏 + 已抓取评论数提示
   function renderSkeleton(n) {
     return `<div class="ai-skeleton">
 <div class="ai-bar w90"></div>
@@ -1016,6 +1264,7 @@
 <div style="margin-top:12px;color:#8a7f70;font-size:12px;text-align:center;font-family:Georgia,'Songti SC',serif">已抓取 <b style="color:#1B365D">${n}</b> 条评论，正在请求 AI 分析...</div>`;
   }
 
+  // 按平台从 DOM 提取帖子标题；HN/Linux.do/知乎 有专用选择器，其它回退到 h1/document.title
   function getPageTitle(name) {
     if (name === 'hackernews') {
       const link = document.querySelector('.storylink, .titleline > a')
@@ -1038,6 +1287,9 @@
         || document.title);
   }
 
+  // === 主流程：抓评论 → AI 总结 → 渲染 → 对抗性审视 ===
+  // 状态机：未抓 / 抓取中（按钮变"停止总结"，点按钮可 token.abort 中止）/ 已生成 / 出错
+  // panel.__aiToken 用于多次 run 之间的版本号校验，避免旧 run 的回调污染新 run 的 UI
   async function runSummary(panel) {
     const body = panel.querySelector('.ai-body');
     const btn = panel.querySelector('#ai-run');
@@ -1075,6 +1327,7 @@
     };
     btn.onclick = () => { token.abort(); finishAbort(); };
 
+    // 按平台选对应的自动加载函数；twitter/linuxdo 启动前要清掉旧缓存
     try {
       const scraper = Scrapers[name];
       const title = getPageTitle(name);
@@ -1119,6 +1372,7 @@
       }
       if (token.aborted) throw abortErr();
 
+      // 评论过滤：minLikes 阈值 → linuxdo 排除楼主（楼主是问题不是评论）→ 按点赞排序 → 截断 maxComments
       let comments = scraper()
           .filter(c => c.likes >= (config.minLikes || 0));
 
@@ -1150,6 +1404,7 @@
         topic.textContent = t.slice(0, 80);
       }
 
+      // 渲染主总结 + 占位 insight 框，先把 main 显示出来，insight 异步再填
       body.className = 'ai-body';
       safeHTML(body, md(main) +
         `<div class="ai-insight" id="ai-insight-loading">` +
@@ -1157,6 +1412,7 @@
         `<div class="ai-insight-notice">正在生成对抗性审视...</div>` +
         `</div>`);
 
+      // 对抗性审视调用：失败时等 2s 重试一次；用户主动 abort 不重试（直接向上抛）
       let insight = '';
       let insightErr = null;
       try {
@@ -1194,6 +1450,8 @@
         insightBox.removeAttribute('id');
       }
 
+      // 组装最终复制源：main + 分隔线 + insight；insight 缺失时只复制 main
+      // 分隔线里的警告文案确保复制出去时读者知道 insight 是 AI 主观判断
       if (insight) {
         const divider = '\n\n---\n\n> ⚠️ 以下为 AI 的对抗性审视——刻意找茬、刻意立论，仅供参考，非社区共识。引用时请注明来源为 AI 生成。\n\n';
         panel.dataset.rawCopy = main + divider + insight;
@@ -1201,6 +1459,7 @@
         panel.dataset.rawCopy = main;
       }
     } catch (e) {
+      // __aiToken 不匹配：用户已点了新一次 run，旧 run 静默退出避免覆盖新 UI
       if (panel.__aiToken !== token) {
         // 已被新 run 接管，静默退出
       } else if (!isAbortErr(e)) {
@@ -1212,6 +1471,7 @@
     }
   }
 
+  // === 入口：等 DOM 就绪后构建 UI ===
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', createUI);
   } else {
