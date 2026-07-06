@@ -1,5 +1,9 @@
 # EchoDistill · AI 评论总结助手
 
+<p align="left">
+    <a href="https://linux.do" alt="LINUX DO"><img src="https://shorturl.at/ggSqS" /></a>
+</p>
+
 > 一个 Tampermonkey 油猴脚本，自动抓取当前页面的评论区，调用任意 OpenAI 兼容 LLM，输出结构化的中文 Markdown 舆情报告，并附带 AI 对抗性审视。
 
 - 版本：`1.7.0`
