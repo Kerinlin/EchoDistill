@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 评论总结助手
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
+// @version      1.8.0
 // @description  自动抓取当前页面的评论并使用 AI 进行总结（Markdown + 主题摘要 + AI 独立洞察）
 // @author       Kerinlin
 // @match        *://*.youtube.com/*
