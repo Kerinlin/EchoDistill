@@ -14,6 +14,7 @@
 // @match        *://news.ycombinator.com/*
 // @match        https://linux.do/*
 // @match        https://*.linux.do/*
+// @match        https://tieba.baidu.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
@@ -420,6 +421,73 @@
           isOP: p.classList.contains('post--topic-owner')
         };
       }).filter(c => c.text);
+    },
+    tieba() {
+      const vueEl = document.querySelector('.thread-container');
+      if (vueEl && vueEl.__vue__) {
+        const list = vueEl.__vue__.$props?.list;
+
+        // 【动态楼中楼采样上限】
+        // 硬约束：主楼层 + 楼中楼 总评论数 ≤ 500（用户配置 maxComments）
+        // 计算公式：每楼中楼 = floor(maxComments / 主楼层数)
+        // 边界：主楼层数 > maxComments 时，每楼取 1 条（保证热门长贴仍可解析）
+        // 兜底：主楼层数 ≤ 0 或缺失时，每楼取 3 条
+        const MAX_TOTAL = config.maxComments || 500;
+        const mainCount = list?.length || 0;
+        const lzlLimit = mainCount > 0
+          ? Math.max(1, Math.floor(MAX_TOTAL / mainCount))
+          : 3;
+
+        if (Array.isArray(list) && list.length) {
+          // Vue 数据中只有 author_id（数字），用其作为 author
+          function extractText(contentArr) {
+            if (!Array.isArray(contentArr)) return '';
+            return contentArr.map(c => {
+              if (c.type === 0) return c.text || '';
+              if (c.type === 2) return c.c ? `[${c.c}]` : (c.text || '');
+              if (c.type === 3) return '[图片]';
+              return '';
+            }).join('');
+          }
+
+          const comments = [];
+          for (const item of list) {
+            const text = extractText(item.content);
+            if (!text) continue;
+            const agree = item.agree?.agree_num || 0;
+            comments.push({
+              author: '用户' + item.author_id,
+              text,
+              likes: agree
+            });
+
+            // 楼中楼（按主楼层数动态采样上限 lzlLimit）
+            const subObj = item.sub_post_list;
+            if (subObj && typeof subObj === 'object' && Array.isArray(subObj.sub_post_list)) {
+              for (const lzl of subObj.sub_post_list.slice(0, lzlLimit)) {
+                const lzlText = extractText(lzl.content);
+                if (lzlText) {
+                  comments.push({
+                    author: '',
+                    text: lzlText,
+                    likes: lzl.agree?.agree_num || 0
+                  });
+                }
+              }
+            }
+          }
+          if (comments.length) return comments;
+        }
+      }
+
+      // fallback：DOM 抓取
+      return Array.from(document.querySelectorAll('.pb-comment-item')).map(el => {
+        const author = (el.querySelector('.head-name')?.textContent || '').trim() || '匿名';
+        const text = (el.querySelector('.pb-rich-text')?.innerText
+            || el.querySelector('.comment-content')?.innerText || '').trim();
+        const likes = parseInt(el.querySelector('.zan-container span')?.textContent?.replace(/[^\d]/g, ''), 10) || 0;
+        return { author, text, likes };
+      }).filter(c => c.text);
     }
   };
 
@@ -434,6 +502,7 @@
     if (h.includes('twitter.com') || h.includes('x.com')) return 'twitter';
     if (h.includes('news.ycombinator.com')) return 'hackernews';
     if (h.includes('linux.do')) return 'linuxdo';
+    if (h.includes('tieba.baidu.com')) return 'tieba';
     return null;
   }
 
@@ -805,6 +874,60 @@
     } catch (e) {
       console.warn('[AI总结] linux.do JSON API 失败，回退 DOM', e);
     }
+  }
+
+  // === 百度贴吧自动加载 ===
+  // 两阶段：
+  // 1. 循环 emit('load-more') 加载全部主楼层（虚拟列表初始只预加载 ~15 条）
+  // 2. 逐步滚动 + 点击 .show-more-lzl 展开楼中楼（初始只有 4-5 条，需点击展开）
+  async function autoLoadTiebaComments(scraper, max, cb, token) {
+    const scrollDom = document.querySelector('.pc-pb-box.styled-scrollbar.deep')
+      || document.scrollingElement;
+
+    // 阶段 1：等待 Vue 组件就绪
+    for (let i = 0; i < 10; i++) {
+      if (token?.aborted) return;
+      const vueEl = document.querySelector('.thread-container');
+      if (vueEl && vueEl.__vue__ && vueEl.__vue__.$props?.list) break;
+      await sleep(500);
+    }
+
+    // 阶段 2：循环触发 load-more 加载全部主楼层
+    const vueEl = document.querySelector('.thread-container');
+    if (vueEl && vueEl.__vue__) {
+      const vm = vueEl.__vue__;
+      for (let i = 0; i < 100; i++) {
+        if (token?.aborted) return;
+        if (!vm.$props?.hasMore) break;
+        if (scraper().length >= max) break;
+        vm.$emit('load-more');
+        await sleep(800);
+        cb && cb(scraper().length);
+      }
+    }
+
+    // 阶段 3：逐步滚动展开楼中楼
+    // 虚拟列表只渲染可视区域附近的楼层，必须步进式滚动让每层 DOM 渲染出来
+    if (scrollDom) {
+      for (let pos = 0; pos <= scrollDom.scrollHeight; pos += 400) {
+        if (token?.aborted) return;
+        if (scraper().length >= max) break;
+        scrollDom.scrollTop = pos;
+        await sleep(300);
+
+        // 点击当前可视区域内的 show-more-lzl 按钮
+        const btns = document.querySelectorAll('.show-more-lzl');
+        for (const btn of btns) {
+          if (token?.aborted) return;
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          await sleep(800);
+          cb && cb(scraper().length);
+        }
+      }
+    }
+
+    const items = scraper();
+    cb && cb(items.length);
   }
 
   // === 模型列表自动补全（OpenAI 兼容 /v1/models）===
@@ -1282,6 +1405,9 @@
           || document.title;
       return t;
     }
+    if (name === 'tieba') {
+      return (document.title.split(' - ')[0].trim() || document.title);
+    }
     return (document.querySelector('h1')?.innerText?.trim()
         || document.title.split('|')[0].split('-')[0].trim()
         || document.title);
@@ -1355,6 +1481,11 @@
         }, token);
       } else if (name === 'bilibili') {
         await autoLoadBiliComments(scraper, config.maxComments, n => {
+          safeHTML(body, renderSkeleton(n));
+          cnt.textContent = n;
+        }, token);
+      } else if (name === 'tieba') {
+        await autoLoadTiebaComments(scraper, config.maxComments, n => {
           safeHTML(body, renderSkeleton(n));
           cnt.textContent = n;
         }, token);

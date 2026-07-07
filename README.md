@@ -15,7 +15,7 @@
 
 ## ✨ 核心特性
 
-- **9 大平台专属抓取器**：YouTube、Reddit、Bilibili、知乎、小红书、X(Twitter)、Hacker News、微博、linux.do，各平台使用独立 DOM/Shadow DOM/JSON API 策略。
+- **9 大平台专属抓取器**：YouTube、Reddit、Bilibili、知乎、小红书、X(Twitter)、Hacker News、linux.do、百度贴吧，各平台使用独立 DOM/Shadow DOM/JSON API 策略。
 - **两段式 AI 输出**
   - **中立归纳报告**：讨论主题 / 核心观点 / 共识 / 分歧与争议 / 情绪与风向 / 高赞金句。
   - **对抗性审视（独立段落）**：AI 主动站到反方位置——质疑高赞、指出盲点、给出押注式判断与信心程度（高/中/低），失败自动重试一次。
@@ -43,8 +43,8 @@
 | 小红书         | `*.xiaohongshu.com/*`     | 评论容器滚动加载 + 去重                                      |
 | X (Twitter) | `*.twitter.com`、`*.x.com` | `article[data-testid="tweet"]` + ARIA 点赞数解析，滚动往返去重 |
 | Hacker News | `news.ycombinator.com`    | 专属分页抓取（`GM_xmlhttpRequest` + DOM 合并），保留回复深度        |
-| 微博          | `*.weibo.com/*`           | 评论区 DOM 查询                                         |
 | linux.do    | `linux.do`、`*.linux.do`   | Discourse `/t/{id}.json` 全量分页拉取 + 回复深度计算           |
+| 百度贴吧        | `tieba.baidu.com/*`       | Vue 虚拟列表 `$props.list` 直读 + `load-more` 翻页 + 楼中楼按主楼层数动态采样 |
 
 
 ---
