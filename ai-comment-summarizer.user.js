@@ -15,6 +15,7 @@
 // @match        https://linux.do/*
 // @match        https://*.linux.do/*
 // @match        https://tieba.baidu.com/*
+// @match        https://*.douyin.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
@@ -488,6 +489,21 @@
         const likes = parseInt(el.querySelector('.zan-container span')?.textContent?.replace(/[^\d]/g, ''), 10) || 0;
         return { author, text, likes };
       }).filter(c => c.text);
+    },
+    douyin() {
+      if (window.__ai_douyin_comments) return window.__ai_douyin_comments;
+      return Array.from(document.querySelectorAll('[data-e2e="comment-item"]')).map(el => {
+        const author = (el.querySelector('.comment-item-info-wrap a')?.textContent || '').trim();
+        const text = (el.querySelector('.FduGc_lz')?.textContent || '').trim();
+        const likeText = (el.querySelector('.comment-item-stats-container p')?.textContent || '0').trim();
+        let likes = 0;
+        if (/万$/.test(likeText)) {
+          likes = Math.round(parseFloat(likeText) * 10000);
+        } else {
+          likes = parseInt(likeText, 10) || 0;
+        }
+        return { author, text, likes };
+      }).filter(c => c.text);
     }
   };
 
@@ -503,6 +519,7 @@
     if (h.includes('news.ycombinator.com')) return 'hackernews';
     if (h.includes('linux.do')) return 'linuxdo';
     if (h.includes('tieba.baidu.com')) return 'tieba';
+    if (h.includes('douyin.com')) return 'douyin';
     return null;
   }
 
@@ -928,6 +945,53 @@
 
     const items = scraper();
     cb && cb(items.length);
+  }
+
+  // === 抖音自动加载 ===
+  // 评论在 .comment-mainContent 独立滚动容器内，虚拟列表。
+  // 滚动到底触发懒加载，配合 Map 去重避免虚拟列表回收节点导致丢失。
+  async function autoLoadDouyinComments(scraper, max, cb, token) {
+    const SAFE = 500;
+    const scroller = document.querySelector('.comment-mainContent');
+    if (!scroller) return;
+    const collected = new Map();
+    let batch = scraper();
+    for (const c of batch) { if (c.text) collected.set(c.text, c); }
+    cb && cb(collected.size);
+    let prevSize = collected.size;
+    let stable = 0;
+    for (let i = 0; i < 40; i++) {
+      if (token?.aborted) return;
+      scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
+      await sleep(1500 + Math.random() * 500);
+      if (token?.aborted) return;
+      batch = scraper();
+      for (const c of batch) { if (c.text) collected.set(c.text, c); }
+      if (collected.size >= max || collected.size >= SAFE) break;
+      if (collected.size === prevSize) { stable++; if (stable >= 4) break; }
+      else stable = 0;
+      prevSize = collected.size;
+      cb && cb(collected.size);
+    }
+    // 从顶部回扫一遍，捞可能被虚拟列表回收的早期评论
+    stable = 0;
+    let lastSize = collected.size;
+    for (let i = 0; i < 10; i++) {
+      if (token?.aborted) return;
+      const step = Math.floor(scroller.scrollHeight / 6);
+      scroller.scrollTo({ top: Math.max(0, scroller.scrollHeight - (i + 1) * step), behavior: 'smooth' });
+      await sleep(1200);
+      if (token?.aborted) return;
+      batch = scraper();
+      for (const c of batch) { if (c.text) collected.set(c.text, c); }
+      if (collected.size === lastSize) { stable++; if (stable >= 3) break; }
+      else stable = 0;
+      lastSize = collected.size;
+      cb && cb(collected.size);
+    }
+    // 写回缓存供 scraper 读取
+    window.__ai_douyin_comments = [...collected.values()];
+    cb && cb(collected.size);
   }
 
   // === 模型列表自动补全（OpenAI 兼容 /v1/models）===
@@ -1408,6 +1472,11 @@
     if (name === 'tieba') {
       return (document.title.split(' - ')[0].trim() || document.title);
     }
+    if (name === 'douyin') {
+      return (document.querySelector('[data-e2e="video-desc"]')?.textContent?.trim()
+          || document.title.split(' - ')[0].trim()
+          || document.title);
+    }
     return (document.querySelector('h1')?.innerText?.trim()
         || document.title.split('|')[0].split('-')[0].trim()
         || document.title);
@@ -1486,6 +1555,12 @@
         }, token);
       } else if (name === 'tieba') {
         await autoLoadTiebaComments(scraper, config.maxComments, n => {
+          safeHTML(body, renderSkeleton(n));
+          cnt.textContent = n;
+        }, token);
+      } else if (name === 'douyin') {
+        delete window.__ai_douyin_comments;
+        await autoLoadDouyinComments(scraper, config.maxComments, n => {
           safeHTML(body, renderSkeleton(n));
           cnt.textContent = n;
         }, token);
