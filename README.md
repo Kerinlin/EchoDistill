@@ -6,7 +6,7 @@
 
 > 一个 Tampermonkey 油猴脚本，自动抓取当前页面的评论区，调用任意 OpenAI 兼容 LLM，输出结构化的中文 Markdown 舆情报告，并附带 AI 对抗性审视。
 
-- 版本：`1.8.0`
+- 版本：`1.8.1`
 - 作者：Kerinlin
 - 协议：MIT
 - 单文件油猴脚本：`ai-comment-summarizer.user.js`（运行时通过 CDN 引入 `html2canvas` 用于复制图片）

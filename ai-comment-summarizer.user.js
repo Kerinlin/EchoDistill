@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI 评论总结助手
 // @namespace    http://tampermonkey.net/
-// @version      1.8.0
+// @version      1.8.1
 // @description  自动抓取当前页面的评论并使用 AI 进行总结（Markdown + 主题摘要 + AI 独立洞察）
 // @author       Kerinlin
 // @match        *://*.youtube.com/*
@@ -493,8 +493,21 @@
     douyin() {
       if (window.__ai_douyin_comments) return window.__ai_douyin_comments;
       return Array.from(document.querySelectorAll('[data-e2e="comment-item"]')).map(el => {
-        const author = (el.querySelector('.comment-item-info-wrap a')?.textContent || '').trim();
-        const text = (el.querySelector('.FduGc_lz')?.textContent || '').trim();
+        const author = (el.querySelector('.comment-item-info-wrap a')?.innerText || '').trim();
+
+        // 正文：info-wrap 之后、stats-container 之前的第一个非空文本块
+        const infoWrap = el.querySelector('.comment-item-info-wrap');
+        const stats = el.querySelector('.comment-item-stats-container');
+        let text = '';
+        if (infoWrap && stats) {
+          let node = infoWrap.nextElementSibling;
+          while (node && node !== stats) {
+            const t = (node.innerText || '').trim();
+            if (t) { text = t; break; }
+            node = node.nextElementSibling;
+          }
+        }
+
         const likeText = (el.querySelector('.comment-item-stats-container p')?.textContent || '0').trim();
         let likes = 0;
         if (/万$/.test(likeText)) {
@@ -948,48 +961,49 @@
   }
 
   // === 抖音自动加载 ===
-  // 评论在 .comment-mainContent 独立滚动容器内，虚拟列表。
+  // 评论列表虚拟化，真正的滚动祖先通过 getComputedStyle 向上遍历定位。
   // 滚动到底触发懒加载，配合 Map 去重避免虚拟列表回收节点导致丢失。
   async function autoLoadDouyinComments(scraper, max, cb, token) {
     const SAFE = 500;
-    const scroller = document.querySelector('.comment-mainContent');
+
+    function findScroller() {
+      let node = document.querySelector('[data-e2e="comment-list"]');
+      while (node && node !== document.body) {
+        const style = getComputedStyle(node);
+        if ((style.overflowY === 'auto' || style.overflowY === 'scroll')
+            && node.scrollHeight > node.clientHeight + 10) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      return document.scrollingElement;
+    }
+
+    const scroller = findScroller();
     if (!scroller) return;
+
     const collected = new Map();
     let batch = scraper();
     for (const c of batch) { if (c.text) collected.set(c.text, c); }
     cb && cb(collected.size);
+
     let prevSize = collected.size;
     let stable = 0;
     for (let i = 0; i < 40; i++) {
       if (token?.aborted) return;
+      if (collected.size >= max || collected.size >= SAFE) break;
       scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
-      await sleep(1500 + Math.random() * 500);
+      await sleep(2000 + Math.random() * 800);
       if (token?.aborted) return;
       batch = scraper();
       for (const c of batch) { if (c.text) collected.set(c.text, c); }
       if (collected.size >= max || collected.size >= SAFE) break;
-      if (collected.size === prevSize) { stable++; if (stable >= 4) break; }
+      if (collected.size === prevSize) { stable++; if (stable >= 5) break; }
       else stable = 0;
       prevSize = collected.size;
       cb && cb(collected.size);
     }
-    // 从顶部回扫一遍，捞可能被虚拟列表回收的早期评论
-    stable = 0;
-    let lastSize = collected.size;
-    for (let i = 0; i < 10; i++) {
-      if (token?.aborted) return;
-      const step = Math.floor(scroller.scrollHeight / 6);
-      scroller.scrollTo({ top: Math.max(0, scroller.scrollHeight - (i + 1) * step), behavior: 'smooth' });
-      await sleep(1200);
-      if (token?.aborted) return;
-      batch = scraper();
-      for (const c of batch) { if (c.text) collected.set(c.text, c); }
-      if (collected.size === lastSize) { stable++; if (stable >= 3) break; }
-      else stable = 0;
-      lastSize = collected.size;
-      cb && cb(collected.size);
-    }
-    // 写回缓存供 scraper 读取
+
     window.__ai_douyin_comments = [...collected.values()];
     cb && cb(collected.size);
   }
@@ -1538,7 +1552,7 @@
           cnt.textContent = n;
         }, token);
       } else if (name === 'linuxdo') {
-        delete window.__ai_linuxdo_comments;
+        window.__ai_linuxdo_comments = null;
         await autoLoadLinuxdoComments(scraper, config.maxComments, n => {
           safeHTML(body, renderSkeleton(n));
           cnt.textContent = n;
@@ -1559,13 +1573,13 @@
           cnt.textContent = n;
         }, token);
       } else if (name === 'douyin') {
-        delete window.__ai_douyin_comments;
+        window.__ai_douyin_comments = null;
         await autoLoadDouyinComments(scraper, config.maxComments, n => {
           safeHTML(body, renderSkeleton(n));
           cnt.textContent = n;
         }, token);
       } else if (name === 'twitter') {
-        delete window.__ai_twitter_comments;
+        window.__ai_twitter_comments = null;
         await autoLoadTwitterComments(scraper, config.maxComments, n => {
           safeHTML(body, renderSkeleton(n));
           cnt.textContent = n;
